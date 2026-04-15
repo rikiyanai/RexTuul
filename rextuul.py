@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-batch_png_to_xp.py — Zero-dependency PNG/XP batch converter and viewer.
+rextuul.py — Zero-dependency PNG/XP batch converter and TUI viewer.
 
 CAPABILITIES:
     - Zero Dependencies: Uses ONLY Python standard library (struct, zlib, gzip).
     - Batch Conversion: PNG -> XP ([P2X] prefix) and XP -> PNG ([X2P] prefix).
     - Pure-Python Codecs: Custom PNG decoder/encoder and REXPaint .xp parser.
     - High-Fidelity Dithering: Ordered (Bayer 4x4) and Floyd-Steinberg support.
-    - Interactive TUI Mode (--watch): Live, scroll-free preview of images and XP files.
+    - Interactive TUI Mode (--watch): Scrollable preview with keyboard navigation.
     - C++ Backend Support (--cpp): Optional high-performance path if C++ tool is available.
 
 USAGE:
-    python3 scripts/batch_png_to_xp.py INPUT_DIR
-    python3 scripts/batch_png_to_xp.py INPUT_DIR --export-png
-    python3 scripts/batch_png_to_xp.py INPUT_DIR --watch
+    python3 rextuul.py INPUT_DIR
+    python3 rextuul.py INPUT_DIR --export-png
+    python3 rextuul.py INPUT_DIR --watch
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ import struct
 import gzip
 import zlib
 import io
+import os
 import tty
 import termios
 import select
@@ -321,57 +322,121 @@ class _WatchRenderer:
             except Exception as e:
                 print(f"Error pre-loading {p.name}: {e}", file=sys.stderr)
 
-    def _draw(self) -> None:
+    def _draw(self, scroll: int = 0) -> tuple[int, int, int, list[int]]:
         cols, rows = shutil.get_terminal_size(fallback=(80, 24))
         tw = self._args.target_cols or (cols - 2)
         tw = max(4, tw)
 
-        # Build whole screen buffer
-        buf = ["\033[H\033[2J"] # Home + Clear
-        for name, sw, sh, pixels, is_xp in self._data:
+        # Build full content; record line offset where each image starts
+        all_lines: list[str] = []
+        image_starts: list[int] = []
+        for name, sw, sh, pixels, _is_xp in self._data:
+            image_starts.append(len(all_lines))
             bar = f"── {name} "
-            buf.append(bar + "─" * max(0, tw - len(bar)) + "\r\n")
-            if is_xp:
-                content = _render_xp_halfblock(XPFile(), tw) # Placeholder, we use cached pix instead
-                # Actually, let's just use the pixels for both, it's simpler
-                content = _render_png_halfblock_raw(pixels, sw, sh, tw)
-            else:
-                content = _render_png_halfblock_raw(pixels, sw, sh, tw)
+            all_lines.append(bar + "─" * max(0, tw - len(bar)))
+            all_lines.extend(_render_png_halfblock_raw(pixels, sw, sh, tw).splitlines())
+            all_lines.append("")
 
-            # Ensure proper line endings for raw-like behavior in some terminals
-            lines = content.splitlines()
-            for line in lines:
-                buf.append(line + "\r\n")
-            buf.append("\r\n")
+        total = len(all_lines)
+        view_rows = rows - 1
+        max_scroll = max(0, total - view_rows)
+        scroll = min(scroll, max_scroll)
+
+        buf = ["\033[H\033[2J"]
+        for line in all_lines[scroll : scroll + view_rows]:
+            buf.append(line + "\r\n")
+
+        cur = max((i for i, s in enumerate(image_starts) if s <= scroll), default=0)
+        status = f" scroll: prev/next image  q: quit  [{cur + 1}/{len(self._data)}]"
+        buf.append(f"\033[{rows};1H\033[7m{status[:cols]}\033[m")
 
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
+        return scroll, max_scroll, rows, image_starts
 
     def run(self) -> None:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        def read_csi() -> bytes:
+            """Read one CSI escape sequence (after \\x1b). Returns b'' on timeout."""
+            seq = b""
+            while select.select([fd], [], [], 0.05)[0]:
+                b = os.read(fd, 1)
+                seq += b
+                if len(seq) < 2:
+                    continue  # need '[' introducer + at least one more byte
+                if b == b"M" and seq == b"[M":
+                    # X10 mouse: 3 raw bytes follow — consume and discard
+                    for _ in range(3):
+                        if select.select([fd], [], [], 0.05)[0]:
+                            os.read(fd, 1)
+                    return b""
+                if b and 0x40 <= b[0] <= 0x7E:  # final byte of CSI
+                    break
+            return seq
+
+        def prev_image(scroll: int, starts: list[int]) -> int:
+            before = [s for s in starts if s < scroll]
+            return before[-1] if before else 0
+
+        def next_image(scroll: int, starts: list[int], max_scroll: int) -> int:
+            after = [s for s in starts if s > scroll]
+            return min(after[0], max_scroll) if after else max_scroll
+
         try:
-            # Alternate Screen, Hide Cursor
-            sys.stdout.write("\033[?1049h\033[?25l")
+            # Alternate screen + hide cursor + enable SGR mouse (scroll events)
+            sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")
             sys.stdout.flush()
-            
-            # Use a flag to signal redraw from the signal handler
-            self._redraw_pending = True
+            tty.setraw(fd)
+
+            scroll = 0
+            max_scroll = 0
+            rows = 24
+            image_starts: list[int] = []
+            redraw = True
+
             def on_resize(*_):
-                self._redraw_pending = True
-            
+                nonlocal redraw
+                redraw = True
             signal.signal(signal.SIGWINCH, on_resize)
-            
+
             while True:
-                if self._redraw_pending:
-                    self._redraw_pending = False
-                    self._draw()
-                # Use a short sleep to prevent 100% CPU while staying responsive
-                import time
-                time.sleep(0.05)
-        except (KeyboardInterrupt, EOFError):
-            pass
+                if redraw:
+                    scroll, max_scroll, rows, image_starts = self._draw(scroll)
+                    redraw = False
+
+                if not select.select([fd], [], [], 0.05)[0]:
+                    continue
+
+                ch = os.read(fd, 1)
+                if ch in (b"q", b"\x03", b"\x04"):
+                    break
+                elif ch == b"\x1b":
+                    seq = read_csi()
+                    if seq.startswith(b"[<"):
+                        # SGR mouse event: \x1b[<btn;col;rowM
+                        parts = seq[2:-1].split(b";")
+                        btn = int(parts[0]) if parts else -1
+                        if btn == 64:   # scroll up
+                            scroll = prev_image(scroll, image_starts); redraw = True
+                        elif btn == 65: # scroll down
+                            scroll = next_image(scroll, image_starts, max_scroll); redraw = True
+                    elif seq in (b"[A", b"[5~"):  # up arrow / page up
+                        scroll = prev_image(scroll, image_starts); redraw = True
+                    elif seq in (b"[B", b"[6~"):  # down arrow / page down
+                        scroll = next_image(scroll, image_starts, max_scroll); redraw = True
+                elif ch == b"j":
+                    scroll = next_image(scroll, image_starts, max_scroll); redraw = True
+                elif ch == b"k":
+                    scroll = prev_image(scroll, image_starts); redraw = True
+                elif ch == b"g":
+                    scroll = 0; redraw = True
+                elif ch == b"G":
+                    scroll = max_scroll; redraw = True
         finally:
-            # Exit Alternate Screen, Show Cursor
-            sys.stdout.write("\033[?1049l\033[?25h")
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            sys.stdout.write("\033[?1000l\033[?1006l\033[?1049l\033[?25h")
             sys.stdout.flush()
 def _tile_to_cells_raw(pixels, sw, sh, out_w, out_h, palette, dither_limit, use_floyd=False):
     sampled = []
